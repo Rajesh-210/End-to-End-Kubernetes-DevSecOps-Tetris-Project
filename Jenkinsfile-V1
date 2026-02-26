@@ -1,0 +1,144 @@
+pipeline {
+    agent any
+
+    tools {
+        nodejs 'nodejs'
+    }
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_REGISTRY = 'https://index.docker.io/v1/'
+        IMAGE_NAME = 'chilukurir/tetrisv1'
+    }
+
+    stages {
+
+        stage('Cleaning Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Source Code') {
+            steps {
+                git branch: 'master',
+                    url: 'https://github.com/Rajesh-210/End-to-End-Kubernetes-DevSecOps-Tetris-Project.git'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                dir('Tetris-V1') {
+                    withSonarQubeEnv('sonar-scanner') {
+                        sh """
+                        ${SCANNER_HOME}/bin/sonar-scanner \
+                        -Dsonar.projectName=Tetris \
+                        -Dsonar.projectKey=Tetris
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                waitForQualityGate abortPipeline: false
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                dir('Tetris-V1') {
+                    sh 'npm install'
+                }
+            }
+        }
+
+        stage('OWASP Dependency Check') {
+            steps {
+                dir('Tetris-V1') {
+                    withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            dependencyCheck(
+                                odcInstallation: 'DP-Check',
+                                additionalArguments: "--scan ./ --nvdApiKey ${NVD_API_KEY} --disableYarnAudit --disableNodeAudit"
+                            )
+                        }
+                    }
+                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                }
+            }
+        }
+
+        stage('Trivy File Scan') {
+            steps {
+                dir('Tetris-V1') {
+                    sh 'trivy fs --scanners vuln . > trivyfs.txt'
+                }
+            }
+        }
+
+        stage('Docker Build Image') {
+            steps {
+                dir('Tetris-V1') {
+                    sh "docker build -t tetrisv1:${BUILD_NUMBER} ."
+                }
+            }
+        }
+
+        stage('Docker Push Image') {
+            steps {
+                withDockerRegistry(credentialsId: 'docker', url: "${DOCKER_REGISTRY}") {
+                    sh """
+                        docker tag tetrisv1:${BUILD_NUMBER} ${IMAGE_NAME}:${BUILD_NUMBER}
+                        docker push ${IMAGE_NAME}:${BUILD_NUMBER}
+                        docker tag tetrisv1:${BUILD_NUMBER} ${IMAGE_NAME}:latest
+                        docker push ${IMAGE_NAME}:latest
+                    """
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                sh "trivy image --scanners vuln ${IMAGE_NAME}:${BUILD_NUMBER} > trivyimage.txt"
+            }
+        }
+
+        stage('Update Kubernetes Manifest') {
+            steps {
+                dir('Manifest-file') {
+                    withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+                        sh """
+                            git config user.email "rajeshchilukuri522@gmail.com"
+                            git config user.name "Rajesh-210"
+
+                            CURRENT_TAG=\$(grep -oP '(?<=tetrisv1:)[^ ]+' deployment-service.yml)
+
+                            sed -i "s/tetrisv1:\${CURRENT_TAG}/tetrisv1:${BUILD_NUMBER}/" deployment-service.yml
+
+                            git add deployment-service.yml
+                            git commit -m "Update deployment image to version ${BUILD_NUMBER}" || echo "No changes to commit"
+
+                            git push https://${GITHUB_TOKEN}@github.com/Rajesh-210/End-to-End-Kubernetes-DevSecOps-Tetris-Project HEAD:master
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'Tetris-V1/trivyfs.txt, trivyimage.txt', allowEmptyArchive: true
+        }
+
+        success {
+            echo "Pipeline executed successfully 🚀"
+        }
+
+        failure {
+            echo "Pipeline failed ❌ Check logs."
+        }
+    }
+}
